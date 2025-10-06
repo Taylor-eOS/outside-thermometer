@@ -97,37 +97,80 @@ class SSD1306:
         self.buffer[0] = 0x40
         self.i2c.writeto(self.addr, self.buffer)
 
+    def measure_text(self, string):
+        w_tmp = len(string) * 8
+        h_tmp = 8
+        if w_tmp == 0:
+            return 0, -1, 0, -1, None, w_tmp, h_tmp
+        buf_len = (w_tmp * h_tmp + 7) // 8
+        buf = bytearray(buf_len)
+        fbch = framebuf.FrameBuffer(buf, w_tmp, h_tmp, framebuf.MONO_HLSB)
+        fbch.fill(0)
+        fbch.text(string, 0, 0, 1)
+        minx = w_tmp
+        maxx = -1
+        miny = h_tmp
+        maxy = -1
+        for yy in range(h_tmp):
+            for xx in range(w_tmp):
+                try:
+                    if fbch.pixel(xx, yy):
+                        if xx < minx: minx = xx
+                        if xx > maxx: maxx = xx
+                        if yy < miny: miny = yy
+                        if yy > maxy: maxy = yy
+                except Exception:
+                    pass
+        if maxx < minx or maxy < miny:
+            return 0, -1, 0, -1, None, w_tmp, h_tmp
+        return minx, maxx, miny, maxy, buf, w_tmp, h_tmp
+
+    def draw_text_scaled(self, buf, tmp_w, tmp_h, minx, maxx, miny, maxy, x, y, scale=1, col=1):
+        if buf is None or maxx < minx or maxy < miny:
+            return 0, 0
+        fbch = framebuf.FrameBuffer(buf, tmp_w, tmp_h, framebuf.MONO_HLSB)
+        vis_w = maxx - minx + 1
+        vis_h = maxy - miny + 1
+        for yy in range(miny, maxy + 1):
+            for xx in range(minx, maxx + 1):
+                if fbch.pixel(xx, yy):
+                    bx = x + (xx - minx) * scale
+                    by = y + (yy - miny) * scale
+                    for sy in range(scale):
+                        py = by + sy
+                        if py < 0 or py >= self.height:
+                            continue
+                        for sx in range(scale):
+                            px = bx + sx
+                            if px < 0 or px >= self.width:
+                                continue
+                            self.pixel(px, py, col)
+        return vis_w * scale, vis_h * scale
+
     def text_scaled(self, string, x, y, scale=None, max_scale=None, col=1, spacing=1):
         if scale is None:
             scale = 1
         if max_scale is not None and scale > max_scale:
             scale = max_scale
+        minx, maxx, miny, maxy, buf, tmp_w, tmp_h = self.measure_text(string)
+        if buf is None or maxx < minx or maxy < miny:
+            return 0
         if scale == 1:
             self.text(string, x, y, col)
+            return maxx - minx + 1
+        self.draw_text_scaled(buf, tmp_w, tmp_h, minx, maxx, miny, maxy, x, y, scale, col)
+        return (maxx - minx + 1) * scale
+
+    def fill_rect(self, x, y, w, h, col=1):
+        if w <= 0 or h <= 0:
             return
-        for ch in string:
-            buf = bytearray(8)
-            fbch = framebuf.FrameBuffer(buf, 8, 8, framebuf.MONO_HLSB)
-            fbch.fill(0)
-            fbch.text(ch, 0, 0, 1)
-            for cy in range(8):
-                for cx in range(8):
-                    if fbch.pixel(cx, cy):
-                        bx = x + cx * scale
-                        by = y + cy * scale
-                        if by < 0 or by >= self.height:
-                            continue
-                        for sy in range(scale):
-                            py = by + sy
-                            if py < 0 or py >= self.height:
-                                continue
-                            row_base = bx
-                            for sx in range(scale):
-                                px = row_base + sx
-                                if px < 0 or px >= self.width:
-                                    continue
-                                self.pixel(px, py, col)
-            x += 8 * scale + spacing * scale
+        x0 = max(0, x)
+        y0 = max(0, y)
+        x1 = min(self.width, x + w)
+        y1 = min(self.height, y + h)
+        for yy in range(y0, y1):
+            for xx in range(x0, x1):
+                self.pixel(xx, yy, col)
 
 class SSD1306_I2C(SSD1306):
     def __init__(self, width, height, i2c, addr=0x3C, external_vcc=False):
@@ -168,8 +211,9 @@ def main():
     I2C_ADDR = 0x3C
     OFFSET_X = 28
     OFFSET_Y = 24
-    C_HIDE_MS = 300
-    DISPLAY_UPDATE_MS = 1000
+    DISPLAY_UPDATE_MS = 10000
+    DUMP_INTERVAL_MS = 5000
+    RECV_BLINK_MS = 250
     sda_pin = SDA_PIN
     scl_pin = SCL_PIN
     i2c = I2C(I2C_ID, sda=Pin(sda_pin), scl=Pin(scl_pin))
@@ -179,54 +223,72 @@ def main():
     channel = 1
     e = init_espnow(channel)
     last_update = time.ticks_ms()
+    last_dump = time.ticks_ms()
     last_recv = time.ticks_ms() - 10000
+    recv_blink_until = time.ticks_ms() - 10000
     temp = 0.0
+
+    def update_display(now):
+        oled.fill(0)
+        num_str = '{:.1f}'.format(temp)
+        minx_n, maxx_n, miny_n, maxy_n, buf_n, tmp_w_n, tmp_h_n = oled.measure_text(num_str)
+        if maxx_n < minx_n:
+            vis_w = 0
+            vis_h = 0
+        else:
+            vis_w = maxx_n - minx_n + 1
+            vis_h = maxy_n - miny_n + 1
+        avail_w = oled.width - 2 * OFFSET_X
+        avail_h = oled.height - 2 * OFFSET_Y
+        if vis_w == 0:
+            scale = 1
+        else:
+            max_scale_by_height = avail_h // max(1, vis_h)
+            if max_scale_by_height < 1:
+                max_scale_by_height = 1
+            max_scale_by_width = avail_w // max(1, vis_w)
+            if max_scale_by_width < 1:
+                max_scale_by_width = 1
+            scale = min(max_scale_by_height, max_scale_by_width)
+            if scale < 1:
+                scale = 1
+        total_w = vis_w * scale
+        x_pos = OFFSET_X + max(0, (avail_w - total_w) // 2)
+        y_pos = OFFSET_Y + max(0, (avail_h - vis_h * scale) // 2)
+        if vis_w:
+            oled.draw_text_scaled(buf_n, tmp_w_n, tmp_h_n, minx_n, maxx_n, miny_n, maxy_n, x_pos, y_pos, scale, 1)
+        oled.show()
+
     while True:
         if e.any():
             mac, data = e.recv()
             if data:
+                temp_str = data.decode()
+                print('Received:', repr(temp_str))
                 try:
-                    temp_str = data.decode()
-                    temp = float(temp_str)
-                except Exception:
-                    pass
-                last_recv = time.ticks_ms()
+                    new_temp = float(temp_str)
+                    temp = new_temp
+                    print('Temperature updated to:', temp)
+                    now = time.ticks_ms()
+                    last_recv = now
+                    update_display(now)
+                    last_update = now
+                except Exception as ex:
+                    print('Error parsing temperature:', ex)
         now = time.ticks_ms()
         if time.ticks_diff(now, last_update) > DISPLAY_UPDATE_MS:
-            oled.fill(0)
-            num_str = '{:.1f}'.format(temp)
-            avail_w = oled.width - 2 * OFFSET_X
-            avail_h = oled.height - 2 * OFFSET_Y
-            if avail_w <= 0 or avail_h <= 0:
-                x_pos = 0
-                y_pos = 0
-                scale = 1
-            else:
-                max_scale_by_height = avail_h // 8
-                if max_scale_by_height < 1:
-                    max_scale_by_height = 1
-                max_scale_by_width = avail_w // (len(num_str) * 8) if len(num_str) > 0 else 1
-                if max_scale_by_width < 1:
-                    max_scale_by_width = 1
-                scale = min(max_scale_by_height, max_scale_by_width)
-                if scale < 1:
-                    scale = 1
-                unit_scale = max(1, scale - 1)
-            hide_c = time.ticks_diff(now, last_recv) < C_HIDE_MS
-            num_w = len(num_str) * 8 * scale
-            unit_w = 0 if hide_c else 8 * unit_scale
-            spacing = 1 * scale if unit_w else 0
-            total_w = num_w + unit_w + spacing
-            x_pos = OFFSET_X + max(0, (avail_w - total_w) // 2)
-            y_pos = OFFSET_Y + max(0, (avail_h - 8 * scale) // 2)
-            oled.text_scaled(num_str, x_pos, y_pos, scale=scale, col=1, spacing=1)
-            if not hide_c:
-                ux = x_pos + num_w + spacing
-                uy = OFFSET_Y + max(0, (avail_h - 8 * unit_scale) // 2)
-                oled.text_scaled('C', ux, uy, scale=unit_scale, col=1, spacing=1)
-            oled.show()
+            update_display(now)
             last_update = now
-        time.sleep_ms(100)
+        if time.ticks_diff(now, last_dump) > DUMP_INTERVAL_MS:
+            print('DISPLAY_DUMP_START {}x{}'.format(oled.width, oled.height))
+            for p in range(oled.pages):
+                start = p * oled.width
+                row = oled.buffer[1 + start:1 + start + oled.width]
+                line = ''.join('{:02x}'.format(b) for b in row)
+                print('PAGE {}: {}'.format(p, line))
+            print('DISPLAY_DUMP_END')
+            last_dump = now
+        time.sleep_ms(50)
 
 if __name__ == "__main__":
     main()

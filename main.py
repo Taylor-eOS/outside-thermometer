@@ -51,6 +51,9 @@ def write_config(i2c, addr):
         pass
 
 def read_raw_bmp(i2c, addr):
+    status = i2c.readfrom_mem(addr, 0xF3, 1)[0]
+    if status & 0x08:
+        time.sleep(0.01)
     d = i2c.readfrom_mem(addr, 0xF7, 6)
     pres = (d[0] << 12) | (d[1] << 4) | (d[2] >> 4)
     temp = (d[3] << 12) | (d[4] << 4) | (d[5] >> 4)
@@ -136,6 +139,7 @@ def main():
     while True:
         try:
             raw_t, raw_p = read_raw_bmp(i2c, bmp_addr)
+            print("Raw temp:", raw_t, "Raw press:", raw_p)
             temp, press = compensate(cal, raw_t, raw_p)
             temp_str = ("{:.2f}".format(temp)).encode()
             sent = send_temperature(e, receiver_mac, temp_str)
